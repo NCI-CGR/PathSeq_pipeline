@@ -1,0 +1,206 @@
+# vim: ft=python
+import os
+import glob
+import pandas
+import itertools
+from collections import defaultdict
+
+configfile: 'totalRNA_config.yaml'
+workdir: os.environ['PWD']
+shell.executable('bash')
+
+
+rule all_align:
+    input:
+        expand('star/{sampleID}/{sampleID}_ReadsPerGene.out.tab', sampleID=d.keys()),
+        'multiqc/mapping_report.html',
+        'multiqc/rnaseqc_report.html',
+        'reports/rnaseqc_v1/report.html',
+        'reports/gene_count_summary.tsv',
+        'multiqc/rrna_report.html',
+        expand('salmon_gene_quant/{sampleID}.gene_quant.txt', sampleID=d.keys()),
+
+    
+rule star:
+    input: 
+        R1 = 'trimmed/{sampleID}_trimmed_R1.fastq.gz',
+        R2 = 'trimmed/{sampleID}_trimmed_R2.fastq.gz'
+    output:
+        log = 'star/{sampleID}/{sampleID}_Log.final.out',
+        bam = 'star/{sampleID}/{sampleID}_Aligned.sortedByCoord.out.bam',
+        count = 'star/{sampleID}/{sampleID}_ReadsPerGene.out.tab'
+    params: 
+        pref = 'star/{sampleID}/{sampleID}',
+        star_idx = config['star'],
+        gtf = config['gencode']
+    threads: 20
+    run:
+        shell('STAR --genomeDir {params.star_idx} \
+            --quantMode GeneCounts \
+            --sjdbGTFfile {params.gtf} \
+            --runThreadN {threads} \
+            --readFilesCommand zcat \
+            --outSAMtype BAM SortedByCoordinate \
+            --readFilesIn {input} \
+            --outFileNamePrefix {params.pref}_')
+
+
+rule star_log:
+    input: rules.star.output.log
+    output: 'multiqc/star/{sampleID}_Log.final.out'
+    run:
+        shell('cp {input} {output}')
+
+
+rule map_multiqc:
+    input: 
+        expand('multiqc/star/{sampleID}_Log.final.out', sampleID=d.keys()),
+        expand('salmon/{sampleID}/quant.sf', sampleID=d.keys())
+    output: 'multiqc/mapping_report.html'
+    run:
+        shell('multiqc -d multiqc/star -d salmon -n mapping_report -o multiqc')
+
+
+
+rule rnaseqc_v2:
+    input: rules.star.output.bam
+    output: 'rnaseqc/{sampleID}.metrics.tsv'
+    threads: 10
+    params:
+        outdir = 'rnaseqc',
+        ref = config['hg_ref'],
+        ann = config['gencode_collapsed']
+    run:
+        shell('rnaseqc {params.ann} \
+            {input} \
+            {params.outdir} \
+            -s {wildcards.sampleID} \
+            --coverage \
+            ')
+
+
+rule multiqc_rnseqc:
+    input: expand('rnaseqc/{sampleID}.metrics.tsv', sampleID=d.keys())
+    output: 'multiqc/rnaseqc_report.html'
+    run:
+        shell('multiqc -d rnaseqc -o multiqc -n rnaseqc_report')
+
+
+
+rule genecounts:
+    input: expand('star/{sampleID}/{sampleID}_ReadsPerGene.out.tab', sampleID=d.keys())
+    output: 'reports/gene_count_summary.tsv'
+    params: gen = config['gencode_parse']
+    run:
+        with open(output[0], 'w') as outfile:
+            outfile.write('\t'.join(['sampleID', '# transcripts', '# genes']) + '\n')
+            for fname in input:
+                id = fname.split('/')[-1].split('_')[0]
+                df = pandas.read_table(fname, sep='\t', skiprows=4, names=['gene_id', 'count', 'for', 'rev']) # count table
+                # merge with full gencode table (not just the STAR output)
+                da = pandas.read_table(params.gen, sep='\t') # look up table for ENSG IDs
+                df = df.merge(da, on='gene_id', how='left')
+                # first check the number of transcripts
+                trans = str(len(df[df['count'] >= 5]))
+                # then check genes
+                df = df[df['gene_type'] == 'protein_coding']
+                genes = str(len(df[df['count'] >= 5]))
+                # output counts
+                outfile.write('\t'.join([id, trans, genes]) + '\n')
+
+
+rule salmon:
+    input:
+        R1 = 'trimmed/{sampleID}_trimmed_R1.fastq.gz',
+        R2 = 'trimmed/{sampleID}_trimmed_R2.fastq.gz'
+    output: 'salmon/{sampleID}/quant.sf'
+    threads: 16
+    params:
+        index = config['salmon']
+    run:
+        shell('salmon quant -i {params.index} -l A \
+            -1 {input.R1} \
+            -2 {input.R2} \
+            -p {threads} \
+            -o salmon/{wildcards.sampleID}')
+
+rule combine_tx:
+    input: rules.salmon.output
+    output: 'salmon_gene_quant/{sampleID}.gene_quant.txt'
+    params: lut = config['tx2gene']
+    run:
+        dt = pandas.read_table(params.lut, sep='\t')
+        ds = pandas.read_table(input[0], sep='\t')
+        ds['TXNAME'] = ds['Name']
+        df = ds.merge(dt, on='TXNAME', how='left')
+        g = df.groupby('GENEID')['TPM'].agg('sum')
+        g.to_csv(output[0], sep='\t')
+
+
+rule bwa_rrna:
+    input:
+        R1 = 'trimmed/{sampleID}_trimmed_R1.fastq.gz',
+        R2 = 'trimmed/{sampleID}_trimmed_R2.fastq.gz'
+    output:
+        log = 'multiqc/bwa_rrna/{sampleID}.rrna.log',
+        bam = 'bwa_rrna/{sampleID}.rrna.bam'
+    params:
+        seed = 15,
+        bwa_ind = config['rrna'],
+        sai = 'bwa_rrna/{sampleID}.rrna.sai'
+    threads: 16
+    run:
+        shell('bwa mem -t {threads} -k {params.seed} {params.bwa_ind} {input} | samtools sort -@ {threads} -o {output.bam} -')
+        shell('samtools index {output.bam}')
+        shell('samtools flagstat {output.bam} > {output.log}')
+
+
+
+rule rrna_report:
+    input: expand('multiqc/bwa_rrna/{sampleID}.rrna.log', sampleID=d.keys())
+    output: 'multiqc/rrna_report.html'
+    run:
+        shell('multiqc -d multiqc/bwa_rrna -o multiqc -n rrna_report')
+
+
+rule addRG:
+    input: rules.star.output.bam
+    output: 'star/{sampleID}/{sampleID}_star_rg.bam'
+    threads: 4
+    run:
+        shell('picard AddOrReplaceReadGroups I={input} O={output} RGID={wildcards.sampleID} RGLB=lib RGPL=illumina RGPU=unit RGSM={wildcards.sampleID}')
+        shell('samtools index {output}')
+
+
+rule bam_text_file:
+    input: expand('star/{sampleID}/{sampleID}_star_rg.bam', sampleID=d.keys())
+    output: 'star/samples.txt'
+    run:
+        shell('echo -e "Sample ID\tBam File\tNotes" > {output}')
+        for i in sorted(input):
+            base = os.path.basename(i)
+            sample = base.split('.')[0]
+            shell('echo -e "%s\t%s\tNA" >> {output}' %(sample, i))
+
+
+rule rnaseqc_v1:
+    input: rules.bam_text_file.output
+    output: 'reports/rnaseqc_v1/report.html'
+    threads: 20
+    params:
+        outdir = 'reports/rnaseqc',
+        ref = config['hg_ref'],
+        ann = config['gencode'],
+        jar = config['rnaseqc']
+    run:
+        shell('java -Xmx60g -jar {params.jar} \
+            -o {params.outdir} \
+            -r {params.ref} \
+            -s {input}  -t {params.ann}')
+
+
+
+
+
+
+

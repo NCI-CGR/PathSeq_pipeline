@@ -1,0 +1,116 @@
+# vim: ft=python
+import os
+import glob
+import itertools
+import pandas
+from collections import defaultdict
+
+configfile: 'totalRNA_config.yaml'
+workdir: os.environ['PWD']
+shell.executable('bash')
+
+def parse_ID(filename):
+    return filename.split('/')[-1].split('_')[0]
+
+allfq = glob.glob(config['fastq_dir'] + config['fastq_glob'])
+
+d = defaultdict(list)
+for key, value in itertools.groupby(allfq, parse_ID):
+    d[key] += list(value)
+
+
+TARGETS = ['reports/pathseq_filter_metrics.txt']
+TARGETS += expand('pathseq_idxstats/{sampleID}.pathseq.idxstats.txt', sampleID=d.keys())
+
+rule all_path:
+    input: TARGETS
+
+
+rule fastq2bam:
+    input:
+        R1 = 'trimmed/{sampleID}_trimmed_R1.fastq.gz',
+        R2 = 'trimmed/{sampleID}_trimmed_R2.fastq.gz'
+    output: 'trimmed_bam/{sampleID}_trimmed.bam'
+    threads: 20
+    params:
+        tempdir = 'temp/{sampleID}'
+    run:
+        shell('picard FastqToSam -Xmx8G \
+            FASTQ={input.R1} \
+            FASTQ2={input.R2} \
+            OUTPUT={output} \
+            TMP_DIR={params.tempdir} \
+            READ_GROUP_NAME=engels \
+            SAMPLE_NAME={wildcards.sampleID} \
+            LIBRARY_NAME=somename \
+            PLATFORM=illumina ')
+
+rule pathseq:
+    input: 'trimmed_bam/{sampleID}_trimmed.bam'
+    output: 
+        'pathseq_out/{sampleID}.pathseq.bam',
+        'pathseq_out/{sampleID}.filter_metrics.txt'
+    params:
+        host = config['path_host'],
+        kmer = config['path_kmer'],
+        min_clip = '70',
+        microbe_fa = config['path_microbe_fa'],
+        microbe_img = config['path_microbe_img'],
+        tax_db = config['path_tax_db'],
+        outdir = 'pathseq_out'
+    threads: 12
+    run:
+        shell('gatk PathSeqPipelineSpark \
+            --input {input} \
+            --filter-bwa-image {params.host} \
+            --kmer-file {params.kmer} \
+            --min-clipped-read-length {params.min_clip} \
+            --microbe-fasta {params.microbe_fa} \
+            --microbe-bwa-image {params.microbe_img} \
+            --taxonomy-file {params.tax_db} \
+            --output {params.outdir}/{wildcards.sampleID}.pathseq.bam \
+            --scores-output {params.outdir}/{wildcards.sampleID}.pathseq.txt \
+            --score-metrics {params.outdir}/{wildcards.sampleID}.score_metrics.txt \
+            --filter-metrics {params.outdir}/{wildcards.sampleID}.filter_metrics.txt \
+            --java-options "-Xmx64G" ')
+
+rule pathseq_bam:
+    input: 'pathseq_out/{sampleID}.pathseq.bam'
+    output: 'pathseq_bam/{sampleID}.pathseq.sorted.bam'
+    run:
+        shell('samtools sort -o {output} -@ {threads} {input}')
+        shell('samtools index {output}')
+
+
+rule pathseq_idxstats:
+    input: 'pathseq_bam/{sampleID}.pathseq.sorted.bam'
+    output: 'pathseq_idxstats/{sampleID}.pathseq.idxstats.txt'
+    run:
+        shell('samtools idxstats {input} > {output}')
+
+
+rule compile_filter_metrics:
+    input: expand('pathseq_out/{sampleID}.filter_metrics.txt', sampleID=d.keys())
+    output: 'reports/pathseq_filter_metrics.txt'
+    run:
+        dfs = []
+        for fname in input:
+            dftemp = pandas.read_csv(fname, sep='\t', skiprows=6)
+            dftemp['sampleID'] = fname.split('/')[-1].split('.')[0]
+            dfs.append(dftemp)
+
+        df = pandas.concat(dfs)
+
+        # do some extra calculations
+        df['final_total_reads_percent'] = df.apply(lambda row: row['FINAL_TOTAL_READS'] / float(row['PRIMARY_READS']), axis=1)
+
+        df.to_csv(output[0], sep='\t', index=False)
+
+
+
+
+
+
+
+
+
